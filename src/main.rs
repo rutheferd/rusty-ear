@@ -116,6 +116,7 @@ async fn setup_webrtc(room: &str, peer_id: &str, socket_id: &str) -> Result<(), 
             println!("Sending ICE candidate");
             // Send the candidate through socket here
             // await sio.emit("deviceCandidate", {"candidate": candidate.to_string(), "to_socket_id": peer_id})
+            socket.emit("deviceCandidate", json!({"candidate": candidate.to_string(), "to_socket_id": peer_id}));
         }
         Box::pin(async {})
     }));
@@ -135,6 +136,7 @@ async fn setup_webrtc(room: &str, peer_id: &str, socket_id: &str) -> Result<(), 
 
     // Send the offer to the peer (e.g., through Socket.IO)
     // await sio.emit("deviceOffer", {"offer": offer, "to_socket_id": peer_id})
+    socket.emit("deviceOffer", json!({"offer": offer, "to_socket_id": peer_id}));
 
     Ok(())
 }
