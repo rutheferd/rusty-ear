@@ -154,7 +154,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .boxed()
         })
         .on("deviceJoinRoom", |payload: Payload, _| {
-            let socket_clone = socket.clone();
             async move {
                 match payload {
                     Payload::Text(text) => {
@@ -218,14 +217,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             .boxed()
         })
-        .on_any(|event, payload, _| {
-            async move {
-                info!("Event: {}, Payload: {:?}", event, payload);
-            }
-            .boxed()
-        })
         .connect()
         .await?;
+
+    socket.on_any(|event, payload, _| {
+        async move {
+            info!("Event: {}, Payload: {:?}", event, payload);
+        }
+        .boxed()
+    });
 
     // Wait for the 'connect' event before emitting any custom events
     notify.notified().await;
