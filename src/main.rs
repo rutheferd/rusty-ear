@@ -1,5 +1,6 @@
 use futures_util::FutureExt;
 use rust_socketio::{
+    Client,
     asynchronous::ClientBuilder, Payload
 };
 use serde_json::json;
@@ -35,7 +36,7 @@ struct CameraStream {
 }
 
 // Initialize WebRTC setup, including ICE servers
-async fn setup_webrtc(room: &str, peer_id: &str, socket_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+async fn setup_webrtc(room: &str, peer_id: &str, socket_id: &str, socket: &Client) -> Result<(), Box<dyn std::error::Error>> {
     let ice_servers = vec![
         RTCIceServer {
             urls: vec!["turn:a.relay.metered.ca:80".to_owned()],
@@ -56,13 +57,10 @@ async fn setup_webrtc(room: &str, peer_id: &str, socket_id: &str) -> Result<(), 
         ..Default::default()
     };
 
-    // MediaEngine and API setup
     let mut media_engine = MediaEngine::default();
     media_engine.register_default_codecs()?;
 
     let mut registry = Registry::new();
-
-    // Use the default set of Interceptors
     registry = register_default_interceptors(registry, &mut media_engine)?;
 
     let api = APIBuilder::new()
@@ -76,8 +74,6 @@ async fn setup_webrtc(room: &str, peer_id: &str, socket_id: &str) -> Result<(), 
 
     // Handle ice connection state changes
     let peer_connection = pc.clone();
-    // Set the handler for ICE connection state
-    // This will notify you when the peer has connected/disconnected
     peer_connection.on_ice_connection_state_change(Box::new(
         move |connection_state: RTCIceConnectionState| {
             println!("Connection State has changed {connection_state}");
@@ -88,15 +84,11 @@ async fn setup_webrtc(room: &str, peer_id: &str, socket_id: &str) -> Result<(), 
         },
     ));
 
-    // Set the handler for Peer connection state
-    // This will notify you when the peer has connected/disconnected
+    // Peer connection state changes
     peer_connection.on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
         println!("Peer Connection State has changed: {s}");
 
         if s == RTCPeerConnectionState::Failed {
-            // Wait until PeerConnection has had no network activity for 30 seconds or another failure. It may be reconnected using an ICE Restart.
-            // Use webrtc.PeerConnectionStateDisconnected if you are interested in detecting faster timeout.
-            // Note that the PeerConnection may come back from PeerConnectionStateDisconnected.
             println!("Peer Connection has gone to failed exiting");
             let _ = done_tx.try_send(());
         }
@@ -104,7 +96,6 @@ async fn setup_webrtc(room: &str, peer_id: &str, socket_id: &str) -> Result<(), 
         Box::pin(async {})
     }));
 
-    // Handle ice gathering state change
     pc.on_ice_gathering_state_change(Box::new(move |ice_gathering_state| {
         println!("ICE gathering state changed: {:?}", ice_gathering_state);
         Box::pin(async {})
@@ -114,14 +105,11 @@ async fn setup_webrtc(room: &str, peer_id: &str, socket_id: &str) -> Result<(), 
     pc.on_ice_candidate(Box::new(move |candidate: Option<RTCIceCandidate>| {
         if let Some(candidate) = candidate {
             println!("Sending ICE candidate");
-            // Send the candidate through socket here
-            // await sio.emit("deviceCandidate", {"candidate": candidate.to_string(), "to_socket_id": peer_id})
             socket.emit("deviceCandidate", json!({"candidate": candidate.to_string(), "to_socket_id": peer_id}));
         }
         Box::pin(async {})
     }));
 
-    // Add a camera stream (this is a simple example; replace it with your camera stream implementation)
     let track = Arc::new(TrackLocalStaticSample::new(RTCRtpCodecCapability {
         mime_type: "video/vp8".to_string(),
         clock_rate: 90000,
@@ -130,16 +118,14 @@ async fn setup_webrtc(room: &str, peer_id: &str, socket_id: &str) -> Result<(), 
 
     pc.add_track(track.clone()).await?;
 
-    // Create an offer
     let offer = pc.create_offer(None).await?;
     pc.set_local_description(offer).await?;
 
-    // Send the offer to the peer (e.g., through Socket.IO)
-    // await sio.emit("deviceOffer", {"offer": offer, "to_socket_id": peer_id})
-    socket.emit("deviceOffer", json!({"offer": offer, "to_socket_id": peer_id}));
+    socket.emit("deviceOffer", json!({"offer": offer, "to_socket_id": peer_id})).await?;
 
     Ok(())
 }
+
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -168,6 +154,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .boxed()
         })
         .on("deviceJoinRoom", |payload: Payload, _| {
+            let socket_clone = socket.clone();
             async move {
                 match payload {
                     Payload::Text(text) => {
@@ -202,7 +189,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             // Now that we have extracted `room`, `id`, and `peer_ids`, we can loop through `peer_ids` and set up WebRTC
                             if !room.is_empty() && !id.is_empty() && !peer_ids.is_empty() {
                                 for peer_id in &peer_ids {
-                                    if let Err(e) = setup_webrtc(&room, peer_id, &id).await {
+                                    if let Err(e) = setup_webrtc(&room, peer_id, &id, &socket_clone).await {
                                         error!("Failed to set up WebRTC for peer {}: {:?}", peer_id, e);
                                     }
                                 }
