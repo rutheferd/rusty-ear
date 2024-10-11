@@ -10,7 +10,7 @@ use log::info;
 use env_logger;
 use tokio::sync::{Mutex, Notify};
 use std::sync::Arc; 
-use webrtc::media::Sample;
+use webrtc::{ice::candidate, media::Sample};
 use gstreamer as gst;
 use gstreamer_app as gst_app;
 use gstreamer::prelude::*;
@@ -35,11 +35,6 @@ const DEVICE_ID: &str = "123"; // Replace with your actual device ID
 // }
 
 async fn add_video_track(peer_connection: Arc<RTCPeerConnection>) {
-
-    if !std::path::Path::new("/home/austinruth/webrtc-rpi/output_fixed264.mp4").exists() {
-        error!("Video file does not exist at the given path");
-        return;
-    }    
 
     let codec_capability = RTCRtpCodecCapability {
         mime_type: "video/vp8".to_string(),
@@ -68,7 +63,8 @@ async fn add_video_track(peer_connection: Arc<RTCPeerConnection>) {
         gst::init().expect("Failed to initialize GStreamer");
 
         let pipeline = gst::parse::launch(
-            "v4l2src device=/dev/video0 ! video/x-raw,format=YUY2,width=640,height=480,framerate=30/1 ! videoconvert ! video/x-raw,format=I420 ! appsink name=sink",
+            // "v4l2src device=/dev/video0 ! videoconvert ! video/x-raw,format=I420 ! appsink name=sink"
+            "avfvideosrc ! videoconvert ! video/x-raw,format=I420 ! appsink name=sink",
         )
         .expect("Failed to parse pipeline description")
         .downcast::<gst::Pipeline>()
@@ -265,6 +261,31 @@ async fn setup_socket_io(peer_connection: Arc<RTCPeerConnection>, notify: Arc<No
             .boxed()
         }
     };
+
+    fn extract_ice_candidate(payload: &Vec<Value>) -> Result<(serde_json::Value, String), &'static str> {
+        let mut candidate_json = Value::Null;
+        let mut additional_string = String::new();
+    
+        // Extracting the ICE candidate object and additional string from the payload
+        if let Some(object) = payload.get(0) {
+            if let Value::Object(candidate_object) = object {
+                // Create a new JSON object containing only the needed fields
+                candidate_json = json!({
+                    "candidate": candidate_object.get("candidate"),
+                    "sdpMLineIndex": candidate_object.get("sdpMLineIndex"),
+                    "sdpMid": candidate_object.get("sdpMid"),
+                    "usernameFragment": candidate_object.get("usernameFragment")
+                });
+            }
+        }
+    
+        // Extracting the additional string from the payload
+        if let Some(Value::String(additional_str)) = payload.get(1) {
+            additional_string = additional_str.clone();
+        }
+    
+        Ok((candidate_json, additional_string))
+    }
     
 
     let dc_callback = {
@@ -274,22 +295,27 @@ async fn setup_socket_io(peer_connection: Arc<RTCPeerConnection>, notify: Arc<No
             async move {
                 match payload {
                     Payload::Text(ice_candidate) => {
-                        println!("ice_candidate {:?}", ice_candidate);
-                        if let Some(first_value) = ice_candidate.first() {
-                            println!("first_value {:?}", first_value);
-                            match serde_json::from_value::<RTCIceCandidateInit>(first_value.clone()) {
-                                Ok(candidate) => {
-                                    if let Err(err) = peer_connection_clone.add_ice_candidate(candidate).await {
-                                        error!("Failed to add ICE candidate: {:?}", err);
-                                    }
-                                }
-                                Err(err) => {
-                                    error!("Failed to deserialize ICE candidate: {:?}", err);
-                                }
+                        // Payload - ice_candidate should have the following format:
+                        // {
+                        //     {"candidate": String("candidate:3139602211 1 udp 2122260223 192.168.4.29 54188 typ host generation 0 ufrag 5p7r network-id 1 network-cost 10"), "sdpMLineIndex": Number(0), "sdpMid": String("0"), "usernameFragment": Null}, 
+                        //     String
+                        // }
+
+                        // Extract the ICE candidate object and additional string from the payload
+                        match extract_ice_candidate(&ice_candidate) {
+                            Ok((candidate_json, additional_string)) => {
+                                let candidate: RTCIceCandidateInit = serde_json::from_value(candidate_json).unwrap();
+                                // Use the candidate and additional_string as needed
+                                // println!("ICE Candidate: {:#?}", candidate);
+                                // println!("Additional String: {}", additional_string);
+                                let _ = peer_connection_clone.add_ice_candidate(candidate).await;
+                            },
+                            Err(e) => {
+                                println!("Error extracting ICE candidate: {}", e);
+                                return;
                             }
-                        } else {
-                            warn!("Received empty ICE candidate payload");
                         }
+
                     },
                     #[allow(deprecated)]
                     Payload::String(ice_candidate) => {
@@ -359,7 +385,7 @@ async fn setup_socket_io(peer_connection: Arc<RTCPeerConnection>, notify: Arc<No
                 if let Some(candidate) = candidate {
                     println!("Sending ICE candidate");
                     let socket = socket_clone.lock(); // Lock the Mutex to access the socket
-                    socket.await.emit("deviceCandidate", json!({"room": "test234", "candidate": candidate.to_string(), "to_socket_id": "test"})).await.unwrap();
+                    socket.await.emit("deviceCandidate", json!({"room": "test234", "candidate": candidate.to_string(), "peerID": "test"})).await.unwrap();
                 }
             }.boxed()
         }
