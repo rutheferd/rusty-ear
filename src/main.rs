@@ -63,8 +63,8 @@ async fn add_video_track(peer_connection: Arc<RTCPeerConnection>) {
         gst::init().expect("Failed to initialize GStreamer");
 
         let pipeline = gst::parse::launch(
-            // "v4l2src device=/dev/video0 ! videoconvert ! video/x-raw,format=I420 ! appsink name=sink"
-            "avfvideosrc ! videoconvert ! video/x-raw,format=I420 ! appsink name=sink",
+            "v4l2src device=/dev/video0 ! videoconvert ! vp8enc ! appsink name=sink"
+            // "avfvideosrc ! videoconvert ! video/x-raw,format=I420 ! appsink name=sink",
         )
         .expect("Failed to parse pipeline description")
         .downcast::<gst::Pipeline>()
@@ -103,7 +103,7 @@ async fn add_video_track(peer_connection: Arc<RTCPeerConnection>) {
                                 duration: Duration::from_millis(33), // Approximately 30 FPS
                                 ..Default::default()
                             };
-
+                    
                             if let Err(err) = video_track.write_sample(&webrtc_sample).await {
                                 error!("Failed to write sample to track: {}", err);
                                 break;
@@ -132,7 +132,7 @@ async fn add_video_track(peer_connection: Arc<RTCPeerConnection>) {
 
 async fn create_peer_connection() -> RTCPeerConnection {
     let mut media_engine = MediaEngine::default();
-    let _ = media_engine.register_default_codecs();
+    media_engine.register_default_codecs().unwrap();
 
     let api = APIBuilder::new()
     .with_media_engine(media_engine)
@@ -149,6 +149,20 @@ async fn create_peer_connection() -> RTCPeerConnection {
         },
         RTCIceServer {
             urls: vec!["turn:a.relay.metered.ca:443".to_owned()],
+            username: "f7d260b72ad1a7d7d2ad79c9".to_owned(),
+            credential: "mEfyvohPVIda0MV2".to_owned(),
+            credential_type: RTCIceCredentialType::Password,
+            ..Default::default()
+        },
+        RTCIceServer {
+            urls: vec!["turn:a.relay.metered.ca:80?transport=tcp".to_owned()],
+            username: "f7d260b72ad1a7d7d2ad79c9".to_owned(),
+            credential: "mEfyvohPVIda0MV2".to_owned(),
+            credential_type: RTCIceCredentialType::Password,
+            ..Default::default()
+        },
+        RTCIceServer {
+            urls: vec!["turn:a.relay.metered.ca:443?transport=tcp".to_owned()],
             username: "f7d260b72ad1a7d7d2ad79c9".to_owned(),
             credential: "mEfyvohPVIda0MV2".to_owned(),
             credential_type: RTCIceCredentialType::Password,
@@ -241,7 +255,7 @@ async fn setup_socket_io(peer_connection: Arc<RTCPeerConnection>, notify: Arc<No
                             if !room.is_empty() && !id.is_empty() && !peer_ids.is_empty() {
                                 for peer_id in &peer_ids {
                                     let pc = Arc::clone(&peer_connection_clone);  // Clone inside the loop
-                                    println!("Sending Offer to Peer...");
+                                    println!("Sending Offer to Peer... {:?}", peer_id);
                                     let offer = pc.create_offer(None).await.unwrap();
                                     pc.set_local_description(offer).await.unwrap();
                                     socket.emit("deviceOffer", json!({
@@ -333,21 +347,54 @@ async fn setup_socket_io(peer_connection: Arc<RTCPeerConnection>, notify: Arc<No
         move |payload, _socket| {
             let peer_connection_clone = Arc::clone(&peer_connection_clone);  // Clone again inside the async block
             async move {
-                if let Payload::Text(text) = payload {
-                    if let Some(Value::Object(map)) = text.get(0) {
-                        let peer_id = map.get("peer_id").and_then(Value::as_str).unwrap_or_default().to_string();
-                        let answer = map.get("answer").and_then(Value::as_str).unwrap_or_default().to_string();
-                        let device_id = map.get("device_id").and_then(Value::as_str).unwrap_or_default().to_string();
-    
+                println!("Device Answer Callback Triggered...");
+                println!{"Payload {:?}", payload}
+                match payload {
+                    Payload::Text(text) => {
+
+                        if text.len() != 3 {
+                            error!("Payload does not contain exactly three elements");
+                        }
+                    
+                        let peer_id = match &text[0] {
+                            Value::String(s) => s.clone(),
+                            _ => {
+                                error!("First payload element is not a String");
+                                return;
+                            }
+                        };
+                    
+                        let answer = match &text[1] {
+                            Value::Object(obj) => obj.clone(),
+                            _ => {
+                                error!("Second payload element is not an Object");
+                                return;
+                            }
+                        };
+                    
+                        let device_id = match &text[2] {
+                            Value::String(s) => s.clone(),
+                            _ => {
+                                error!("Third payload element is not a String");
+                                return;
+                            }
+                        };
+                    
+                        info!("Parsed payload successfully");
+        
                         println!("Peer ID: {}", peer_id);
-                        println!("Answer: {}", answer);
+                        println!("Answer: {:?}", answer);
                         println!("Device ID: {}", device_id);
-    
+        
                         if device_id == DEVICE_ID {
-                            let answer: RTCSessionDescription = serde_json::from_str(&answer).unwrap();
+                            let answer_json = serde_json::to_string(&answer).unwrap();
+                            let answer: RTCSessionDescription = serde_json::from_str(&answer_json).unwrap();
                             peer_connection_clone.set_remote_description(answer).await.unwrap();
                         }
-                    }
+                    },
+                    Payload::Binary(bin_data) => println!("Received binary data: {:#?}", bin_data),
+                    #[allow(deprecated)]
+                    Payload::String(data) => println!("Received String data: {:?}", data)
                 }
             }.boxed()
         }
@@ -367,12 +414,6 @@ async fn setup_socket_io(peer_connection: Arc<RTCPeerConnection>, notify: Arc<No
         .on("deviceCandidate", dc_callback)
         .on("deviceAnswer", da_callback)
         .on("disconnect", disconnect_callback)
-        .on_any(|event, payload, _| {
-            async move {
-                info!("Event: {}, Payload: {:?}", event, payload);
-            }
-            .boxed()
-        })
         .connect()
         .await
         .expect("Connection failed")));
@@ -384,6 +425,7 @@ async fn setup_socket_io(peer_connection: Arc<RTCPeerConnection>, notify: Arc<No
             async move {
                 if let Some(candidate) = candidate {
                     println!("Sending ICE candidate");
+                    // println!("Candidate: {:?}", candidate);
                     let socket = socket_clone.lock(); // Lock the Mutex to access the socket
                     socket.await.emit("deviceCandidate", json!({"room": "test234", "candidate": candidate.to_string(), "peerID": "test"})).await.unwrap();
                 }
