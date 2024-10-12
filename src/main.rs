@@ -10,7 +10,7 @@ use log::info;
 use env_logger;
 use tokio::sync::{Mutex, Notify};
 use std::sync::Arc; 
-use webrtc::media::Sample;
+use webrtc::{api::setting_engine, media::Sample};
 use gstreamer as gst;
 use gstreamer_app as gst_app;
 use gstreamer::prelude::*;
@@ -35,6 +35,9 @@ use dotenv::dotenv;
 use std::env;
 use once_cell::sync::Lazy;
 use tokio::sync::OnceCell;
+use webrtc::api::setting_engine::SettingEngine;
+use webrtc::ice::network_type::NetworkType;
+
 
 static JWT_SECRET: Lazy<String> = Lazy::new(|| {
     dotenv().ok();
@@ -87,8 +90,8 @@ async fn add_video_track(peer_connection: Arc<RTCPeerConnection>) {
         gst::init().expect("Failed to initialize GStreamer");
 
         let pipeline = gst::parse::launch(
-            "v4l2src device=/dev/video0 ! videoconvert ! vp8enc ! appsink name=sink"
-            // "avfvideosrc ! videoconvert ! video/x-raw,format=I420 ! appsink name=sink",
+            "v4l2src device=/dev/video0 ! videoconvert ! vp8enc target-bitrate=3000000 deadline=1 cpu-used=2 threads=4 ! appsink name=sink"
+            // "avfvideosrc ! videoconvert ! vp8enc ! appsink name=sink",
         )
         .expect("Failed to parse pipeline description")
         .downcast::<gst::Pipeline>()
@@ -131,8 +134,6 @@ async fn add_video_track(peer_connection: Arc<RTCPeerConnection>) {
                             if let Err(err) = video_track.write_sample(&webrtc_sample).await {
                                 error!("Failed to write sample to track: {}", err);
                                 break;
-                            } else {
-                                info!("Successfully wrote a sample to the track");
                             }
                         } else {
                             warn!("Failed to map buffer as readable");
@@ -156,14 +157,28 @@ async fn add_video_track(peer_connection: Arc<RTCPeerConnection>) {
 
 async fn create_peer_connection() -> RTCPeerConnection {
     let mut media_engine = MediaEngine::default();
+    let mut setting_engine = SettingEngine::default();
     media_engine.register_default_codecs().unwrap();
+
+    // Restrict network types to IPv4
+    let network_types = vec![
+        NetworkType::Udp4,
+        NetworkType::Tcp4,
+    ];
+
+    setting_engine.set_network_types(network_types.clone());
 
     let api = APIBuilder::new()
     .with_media_engine(media_engine)
+    .with_setting_engine(setting_engine)
     // .with_interceptor_registry(registry)
     .build();
 
     let ice_servers = vec![
+        RTCIceServer {
+            urls: vec!["stun:stun.relay.metered.ca:80".to_owned()],
+            ..Default::default()
+        },
         RTCIceServer {
             urls: vec!["turn:a.relay.metered.ca:80".to_owned()],
             username: "f7d260b72ad1a7d7d2ad79c9".to_owned(),
@@ -171,13 +186,13 @@ async fn create_peer_connection() -> RTCPeerConnection {
             credential_type: RTCIceCredentialType::Password,
             ..Default::default()
         },
-        // RTCIceServer {
-        //     urls: vec!["turn:a.relay.metered.ca:443".to_owned()],
-        //     username: "f7d260b72ad1a7d7d2ad79c9".to_owned(),
-        //     credential: "mEfyvohPVIda0MV2".to_owned(),
-        //     credential_type: RTCIceCredentialType::Password,
-        //     ..Default::default()
-        // }
+        RTCIceServer {
+            urls: vec!["turn:a.relay.metered.ca:443".to_owned()],
+            username: "f7d260b72ad1a7d7d2ad79c9".to_owned(),
+            credential: "mEfyvohPVIda0MV2".to_owned(),
+            credential_type: RTCIceCredentialType::Password,
+            ..Default::default()
+        },
         RTCIceServer {
             urls: vec!["turn:a.relay.metered.ca:80?transport=tcp".to_owned()],
             username: "f7d260b72ad1a7d7d2ad79c9".to_owned(),
@@ -185,19 +200,20 @@ async fn create_peer_connection() -> RTCPeerConnection {
             credential_type: RTCIceCredentialType::Password,
             ..Default::default()
         },
-        // RTCIceServer {
-        //     urls: vec!["turn:a.relay.metered.ca:443?transport=tcp".to_owned()],
-        //     username: "f7d260b72ad1a7d7d2ad79c9".to_owned(),
-        //     credential: "mEfyvohPVIda0MV2".to_owned(),
-        //     credential_type: RTCIceCredentialType::Password,
-        //     ..Default::default()
-        // }
+        RTCIceServer {
+            urls: vec!["turn:a.relay.metered.ca:443?transport=tcp".to_owned()],
+            username: "f7d260b72ad1a7d7d2ad79c9".to_owned(),
+            credential: "mEfyvohPVIda0MV2".to_owned(),
+            credential_type: RTCIceCredentialType::Password,
+            ..Default::default()
+        }
     ];
 
     let rtc_config = RTCConfiguration {
         ice_servers,
         ..Default::default()
     };
+    
 
     api.new_peer_connection(rtc_config).await.unwrap()
 }
@@ -548,7 +564,7 @@ async fn wait_for_room() {
                 if ROOM.set(room.clone()).is_ok() {
                     break;
                 } else {
-                    error!("Failed to set the room.");
+                    warn!("Failed to set the room.");
                 }
             }
             None => {
