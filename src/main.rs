@@ -10,7 +10,7 @@ use log::info;
 use env_logger;
 use tokio::sync::{Mutex, Notify};
 use std::sync::Arc; 
-use webrtc::{ice::candidate, media::Sample};
+use webrtc::media::Sample;
 use gstreamer as gst;
 use gstreamer_app as gst_app;
 use gstreamer::prelude::*;
@@ -27,8 +27,32 @@ use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSampl
 use webrtc::track::track_local::TrackLocal;
 use webrtc::api::APIBuilder;
 use log::{error, warn};
+use reqwest::StatusCode;
+use reqwest::Client as ReqwestClient;
+use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+use serde::Serialize;
+use dotenv::dotenv;
+use std::env;
+use once_cell::sync::Lazy;
+use tokio::sync::OnceCell;
 
-const DEVICE_ID: &str = "123"; // Replace with your actual device ID
+static JWT_SECRET: Lazy<String> = Lazy::new(|| {
+    dotenv().ok();
+    env::var("JWT_SECRET").expect("JWT_SECRET must be set")
+});
+
+static USER_ID: Lazy<String> = Lazy::new(|| {
+    dotenv().ok();
+    env::var("USER_ID").expect("USER_ID must be set")
+});
+
+static DEVICE_ID: Lazy<String> = Lazy::new(|| {
+    dotenv().ok();
+    env::var("DEVICE_ID").expect("DEVICE_ID must be set")
+});
+
+static ROOM: OnceCell<String> = OnceCell::const_new();
+
 // Shared variable for camera stream (similar to Python example)
 // struct CameraStream {
 //     track: Arc<TrackLocalStaticSample>,
@@ -147,13 +171,13 @@ async fn create_peer_connection() -> RTCPeerConnection {
             credential_type: RTCIceCredentialType::Password,
             ..Default::default()
         },
-        RTCIceServer {
-            urls: vec!["turn:a.relay.metered.ca:443".to_owned()],
-            username: "f7d260b72ad1a7d7d2ad79c9".to_owned(),
-            credential: "mEfyvohPVIda0MV2".to_owned(),
-            credential_type: RTCIceCredentialType::Password,
-            ..Default::default()
-        },
+        // RTCIceServer {
+        //     urls: vec!["turn:a.relay.metered.ca:443".to_owned()],
+        //     username: "f7d260b72ad1a7d7d2ad79c9".to_owned(),
+        //     credential: "mEfyvohPVIda0MV2".to_owned(),
+        //     credential_type: RTCIceCredentialType::Password,
+        //     ..Default::default()
+        // }
         RTCIceServer {
             urls: vec!["turn:a.relay.metered.ca:80?transport=tcp".to_owned()],
             username: "f7d260b72ad1a7d7d2ad79c9".to_owned(),
@@ -161,13 +185,13 @@ async fn create_peer_connection() -> RTCPeerConnection {
             credential_type: RTCIceCredentialType::Password,
             ..Default::default()
         },
-        RTCIceServer {
-            urls: vec!["turn:a.relay.metered.ca:443?transport=tcp".to_owned()],
-            username: "f7d260b72ad1a7d7d2ad79c9".to_owned(),
-            credential: "mEfyvohPVIda0MV2".to_owned(),
-            credential_type: RTCIceCredentialType::Password,
-            ..Default::default()
-        }
+        // RTCIceServer {
+        //     urls: vec!["turn:a.relay.metered.ca:443?transport=tcp".to_owned()],
+        //     username: "f7d260b72ad1a7d7d2ad79c9".to_owned(),
+        //     credential: "mEfyvohPVIda0MV2".to_owned(),
+        //     credential_type: RTCIceCredentialType::Password,
+        //     ..Default::default()
+        // }
     ];
 
     let rtc_config = RTCConfiguration {
@@ -180,29 +204,13 @@ async fn create_peer_connection() -> RTCPeerConnection {
 
 async fn setup_socket_io(peer_connection: Arc<RTCPeerConnection>, notify: Arc<Notify>) {
 
-    // async fn send_offer(socket: Client, pc: Arc<RTCPeerConnection>, room: &str, socket_id: &str, to_socket_id: &str) -> Result<(), Box<dyn std::error::Error>> {
-    //     println!("Sending Offer to Peer...");
-    //     let offer = pc.create_offer(None).await?;
-    //     pc.set_local_description(offer).await?;
-    //     socket.emit("deviceOffer", json!({
-    //         "socketID": socket_id,
-    //         "peerID": to_socket_id,
-    //         "sdp": pc.local_description().await.as_ref().map(|desc| desc.sdp.to_string()).unwrap_or_default(),
-    //         "type": pc.local_description().await.as_ref().map(|desc| desc.sdp_type.to_string()).unwrap_or_default(),
-    //         "device_id": DEVICE_ID, // Replace with your actual device ID
-    //         "room": room,
-    //     })).await?;
-
-    //     Ok(())
-    // }
-
     let device_connect_callback = {
         let notify = notify.clone();
         move |_, socket: Client| {
             let notify = notify.clone();
             async move {
                 info!("Connected to the server.");
-                socket.emit("statusUpdate", json!({"currentStatus": "ready", "id": DEVICE_ID})).await.unwrap();
+                socket.emit("statusUpdate", json!({"currentStatus": "ready", "id": *DEVICE_ID})).await.unwrap();
                 // Notify that the connection has been established
                 notify.notify_one();
             }.boxed()
@@ -263,7 +271,7 @@ async fn setup_socket_io(peer_connection: Arc<RTCPeerConnection>, notify: Arc<No
                                         "peerID": peer_id,
                                         "sdp": pc.local_description().await.as_ref().map(|desc| desc.sdp.to_string()).unwrap_or_default(),
                                         "type": pc.local_description().await.as_ref().map(|desc| desc.sdp_type.to_string()).unwrap_or_default(),
-                                        "device_id": DEVICE_ID, // Replace with your actual device ID
+                                        "device_id": *DEVICE_ID, // Replace with your actual device ID
                                         "room": room,
                                     })).await.unwrap();
                                 }
@@ -317,7 +325,7 @@ async fn setup_socket_io(peer_connection: Arc<RTCPeerConnection>, notify: Arc<No
 
                         // Extract the ICE candidate object and additional string from the payload
                         match extract_ice_candidate(&ice_candidate) {
-                            Ok((candidate_json, additional_string)) => {
+                            Ok((candidate_json, _additional_string)) => {
                                 let candidate: RTCIceCandidateInit = serde_json::from_value(candidate_json).unwrap();
                                 // Use the candidate and additional_string as needed
                                 // println!("ICE Candidate: {:#?}", candidate);
@@ -386,7 +394,7 @@ async fn setup_socket_io(peer_connection: Arc<RTCPeerConnection>, notify: Arc<No
                         println!("Answer: {:?}", answer);
                         println!("Device ID: {}", device_id);
         
-                        if device_id == DEVICE_ID {
+                        if device_id == *DEVICE_ID {
                             let answer_json = serde_json::to_string(&answer).unwrap();
                             let answer: RTCSessionDescription = serde_json::from_str(&answer_json).unwrap();
                             peer_connection_clone.set_remote_description(answer).await.unwrap();
@@ -427,7 +435,8 @@ async fn setup_socket_io(peer_connection: Arc<RTCPeerConnection>, notify: Arc<No
                     println!("Sending ICE candidate");
                     // println!("Candidate: {:?}", candidate);
                     let socket = socket_clone.lock(); // Lock the Mutex to access the socket
-                    socket.await.emit("deviceCandidate", json!({"room": "test234", "candidate": candidate.to_string(), "peerID": "test"})).await.unwrap();
+                    let room = ROOM.get().expect("ROOM should be set");
+                    socket.await.emit("deviceCandidate", json!({"room": room, "candidate": candidate.to_string(), "peerID": "test"})).await.unwrap();
                 }
             }.boxed()
         }
@@ -447,18 +456,117 @@ async fn setup_socket_io(peer_connection: Arc<RTCPeerConnection>, notify: Arc<No
 
     // Now it's safe to emit the 'deviceJoinRoom' event
     info!("Emitting deviceJoinRoom event.");
+    let room = ROOM.get().expect("ROOM should be set");
     socket.lock()
-        .await.emit("deviceJoinRoom", json!({"room": "test234"}))
+        .await.emit("deviceJoinRoom", json!({"room": room}))
         .await
         .expect("Failed to emit deviceJoinRoom event");
 
     add_video_track(Arc::clone(&peer_connection)).await;
 }
 
+async fn get_room() -> Option<String> {
+    info!("Checking for User in valid room...");
+    let token = generate_token(); // Assume this function is defined
+
+    let url = format!("https://scope-api.trl-ai.com/users/{}/current_room", *USER_ID);
+
+    let client = ReqwestClient::new();
+
+    let response = match client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+    {
+        Ok(resp) => resp,
+        Err(err) => {
+            error!("Failed to send request: {}", err);
+            return None;
+        }
+    };
+
+    if response.status() == StatusCode::OK {
+        let data: Value = match response.json().await {
+            Ok(json) => json,
+            Err(err) => {
+                error!("Failed to parse response JSON: {}", err);
+                return None;
+            }
+        };
+
+        match data.get("current_room") {
+            Some(Value::String(s)) if s.is_empty() => {
+                error!("User hasn't joined a room...");
+                None
+            }
+            Some(Value::String(s)) => Some(s.clone()),
+            _ => {
+                error!("'current_room' field is missing or not a string");
+                None
+            }
+        }
+    } else {
+        error!("Failed to fetch current room: {}", response.status());
+        None
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct Claims {
+    user_id: String,
+    // You can add other fields as needed
+}
+
+fn generate_token() -> String {
+    info!("Generating Token...");
+    let claims = Claims {
+        user_id: (*USER_ID.to_owned()).to_string(),
+    };
+
+    let header = Header {
+        alg: Algorithm::HS256,
+        ..Default::default()
+    };
+
+    let encoding_key = EncodingKey::from_secret(JWT_SECRET.as_bytes());
+
+    match encode(&header, &claims, &encoding_key) {
+        Ok(token) => token,
+        Err(err) => {
+            log::error!("Failed to generate token: {}", err);
+            String::new()
+        }
+    }
+}
+
+async fn wait_for_room() {
+    loop {
+        match get_room().await {
+            Some(room) => {
+                info!("Found a valid room: {}", room);
+                if ROOM.set(room.clone()).is_ok() {
+                    break;
+                } else {
+                    error!("Failed to set the room.");
+                }
+            }
+            None => {
+                info!("No valid room found, retrying...");
+            }
+        }
+        // Sleep before trying again
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging
     env_logger::init();
+
+    wait_for_room().await;
 
     // Create a Notify to wait for the 'connect' event
     let notify = Arc::new(Notify::new());
