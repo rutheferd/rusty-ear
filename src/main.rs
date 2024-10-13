@@ -592,6 +592,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     setup_socket_io(pc.clone(), notify.clone()).await;
 
+    let doctor_pc: Arc<RTCPeerConnection> =  Arc::new(create_peer_connection().await);
+
+    setup_socket_io(doctor_pc.clone(), notify.clone()).await;
+
     // Keep the client running to listen for events
     loop {
         tokio::time::sleep(Duration::from_secs(60)).await;
