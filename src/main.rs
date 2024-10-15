@@ -1,16 +1,14 @@
-use futures_util::FutureExt;
-use rust_socketio::{
-    asynchronous::{Client, ClientBuilder},
-    Payload,
-};
+use futures_util::SinkExt;
+use futures_util::StreamExt;
 use serde_json::json;
 use serde_json::Value;
+use tokio::net::TcpStream;
+use tokio_tungstenite::WebSocketStream;
 use std::time::Duration;
 use log::info;
 use env_logger;
-use tokio::sync::{Mutex, Notify};
 use std::sync::Arc; 
-use webrtc::{api::setting_engine, media::Sample};
+use webrtc::media::Sample;
 use gstreamer as gst;
 use gstreamer_app as gst_app;
 use gstreamer::prelude::*;
@@ -18,9 +16,6 @@ use webrtc::{api::media_engine::MediaEngine, ice_transport::ice_credential_type:
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
-use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
-use webrtc::ice_transport::ice_gatherer_state::RTCIceGathererState;
-use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit};
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
@@ -37,6 +32,8 @@ use once_cell::sync::Lazy;
 use tokio::sync::OnceCell;
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::ice::network_type::NetworkType;
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::protocol::Message;
 
 
 static JWT_SECRET: Lazy<String> = Lazy::new(|| {
@@ -49,12 +46,13 @@ static USER_ID: Lazy<String> = Lazy::new(|| {
     env::var("USER_ID").expect("USER_ID must be set")
 });
 
+#[allow(dead_code)]
 static DEVICE_ID: Lazy<String> = Lazy::new(|| {
     dotenv().ok();
     env::var("DEVICE_ID").expect("DEVICE_ID must be set")
 });
 
-static ROOM: OnceCell<String> = OnceCell::const_new();
+static ROOM: OnceCell<u64> = OnceCell::const_new();
 
 // Shared variable for camera stream (similar to Python example)
 // struct CameraStream {
@@ -218,269 +216,6 @@ async fn create_peer_connection() -> RTCPeerConnection {
     api.new_peer_connection(rtc_config).await.unwrap()
 }
 
-async fn setup_socket_io(peer_connection: Arc<RTCPeerConnection>, notify: Arc<Notify>) {
-
-    let device_connect_callback = {
-        let notify = notify.clone();
-        move |_, socket: Client| {
-            let notify = notify.clone();
-            async move {
-                info!("Connected to the server.");
-                socket.emit("statusUpdate", json!({"currentStatus": "ready", "id": *DEVICE_ID})).await.unwrap();
-                // Notify that the connection has been established
-                notify.notify_one();
-            }.boxed()
-        }
-    };
-
-    let connect_callback = |_, _socket: Client| {
-        async move {
-            println!("Connected to the server.");
-        }.boxed()
-    };
-
-    let djr_callback = {
-        let peer_connection_clone = Arc::clone(&peer_connection);  // Clone once outside the closure
-        move |payload, socket: Client| {
-            let peer_connection_clone = Arc::clone(&peer_connection_clone);  // Clone again inside the closure
-            async move {
-                match payload {
-                    Payload::Binary(bin_data) => println!("Received binary data: {:#?}", bin_data),
-                    #[allow(deprecated)]
-                    Payload::String(data) => println!("Received String Data: {}", data),
-                    Payload::Text(text) => {
-                        let mut room = String::new();
-                        let mut id = String::new();
-                        let mut peer_ids: Vec<String> = Vec::new();
-    
-                        if let Some(Value::Object(map)) = text.get(0) {
-                            // Extract "room" from the JSON object
-                            if let Some(Value::String(room_value)) = map.get("room") {
-                                println!("Room: {}", room_value);
-                                room = room_value.clone();
-                            }
-    
-                            // Extract "id" from the JSON object
-                            if let Some(Value::String(id_value)) = map.get("id") {
-                                println!("ID: {}", id_value);
-                                id = id_value.clone();
-                            }
-    
-                            // Extract "peers" from the JSON object
-                            if let Some(Value::Array(peers)) = map.get("peers") {
-                                peer_ids = peers
-                                    .iter()
-                                    .filter_map(|p| p.as_str().map(String::from))
-                                    .collect();
-                                println!("Peer IDs: {:?}", peer_ids);
-                            }
-    
-                            // Now that we have extracted `room`, `id`, and `peer_ids`, we can loop through `peer_ids` and set up WebRTC
-                            if !room.is_empty() && !id.is_empty() && !peer_ids.is_empty() {
-                                for peer_id in &peer_ids {
-                                    let pc = Arc::clone(&peer_connection_clone);  // Clone inside the loop
-                                    println!("Sending Offer to Peer... {:?}", peer_id);
-                                    let offer = pc.create_offer(None).await.unwrap();
-                                    pc.set_local_description(offer).await.unwrap();
-                                    socket.emit("deviceOffer", json!({
-                                        "socketID": id,
-                                        "peerID": peer_id,
-                                        "sdp": pc.local_description().await.as_ref().map(|desc| desc.sdp.to_string()).unwrap_or_default(),
-                                        "type": pc.local_description().await.as_ref().map(|desc| desc.sdp_type.to_string()).unwrap_or_default(),
-                                        "device_id": *DEVICE_ID, // Replace with your actual device ID
-                                        "room": room,
-                                    })).await.unwrap();
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            .boxed()
-        }
-    };
-
-    fn extract_ice_candidate(payload: &Vec<Value>) -> Result<(serde_json::Value, String), &'static str> {
-        let mut candidate_json = Value::Null;
-        let mut additional_string = String::new();
-    
-        // Extracting the ICE candidate object and additional string from the payload
-        if let Some(object) = payload.get(0) {
-            if let Value::Object(candidate_object) = object {
-                // Create a new JSON object containing only the needed fields
-                candidate_json = json!({
-                    "candidate": candidate_object.get("candidate"),
-                    "sdpMLineIndex": candidate_object.get("sdpMLineIndex"),
-                    "sdpMid": candidate_object.get("sdpMid"),
-                    "usernameFragment": candidate_object.get("usernameFragment")
-                });
-            }
-        }
-    
-        // Extracting the additional string from the payload
-        if let Some(Value::String(additional_str)) = payload.get(1) {
-            additional_string = additional_str.clone();
-        }
-    
-        Ok((candidate_json, additional_string))
-    }
-    
-
-    let dc_callback = {
-        let peer_connection_clone = Arc::clone(&peer_connection);  // Clone outside the closure
-        move |payload, _socket| {
-            let peer_connection_clone = Arc::clone(&peer_connection_clone);  // Clone again inside the async block
-            async move {
-                match payload {
-                    Payload::Text(ice_candidate) => {
-                        // Payload - ice_candidate should have the following format:
-                        // {
-                        //     {"candidate": String("candidate:3139602211 1 udp 2122260223 192.168.4.29 54188 typ host generation 0 ufrag 5p7r network-id 1 network-cost 10"), "sdpMLineIndex": Number(0), "sdpMid": String("0"), "usernameFragment": Null}, 
-                        //     String
-                        // }
-
-                        // Extract the ICE candidate object and additional string from the payload
-                        match extract_ice_candidate(&ice_candidate) {
-                            Ok((candidate_json, _additional_string)) => {
-                                let candidate: RTCIceCandidateInit = serde_json::from_value(candidate_json).unwrap();
-                                // Use the candidate and additional_string as needed
-                                // println!("ICE Candidate: {:#?}", candidate);
-                                // println!("Additional String: {}", additional_string);
-                                let _ = peer_connection_clone.add_ice_candidate(candidate).await;
-                            },
-                            Err(e) => {
-                                println!("Error extracting ICE candidate: {}", e);
-                                return;
-                            }
-                        }
-
-                    },
-                    #[allow(deprecated)]
-                    Payload::String(ice_candidate) => {
-                        let candidate: RTCIceCandidateInit = serde_json::from_str(&ice_candidate).unwrap();
-                        peer_connection_clone.add_ice_candidate(candidate).await.unwrap();
-                    },
-                    Payload::Binary(bin_data) => println!("Received binary data: {:#?}", bin_data),
-                }
-            }.boxed()
-        }
-    };
-
-    let da_callback = {
-        let peer_connection_clone = Arc::clone(&peer_connection);  // Clone outside the closure
-        move |payload, _socket| {
-            let peer_connection_clone = Arc::clone(&peer_connection_clone);  // Clone again inside the async block
-            async move {
-                println!("Device Answer Callback Triggered...");
-                println!{"Payload {:?}", payload}
-                match payload {
-                    Payload::Text(text) => {
-
-                        if text.len() != 3 {
-                            error!("Payload does not contain exactly three elements");
-                        }
-                    
-                        let peer_id = match &text[0] {
-                            Value::String(s) => s.clone(),
-                            _ => {
-                                error!("First payload element is not a String");
-                                return;
-                            }
-                        };
-                    
-                        let answer = match &text[1] {
-                            Value::Object(obj) => obj.clone(),
-                            _ => {
-                                error!("Second payload element is not an Object");
-                                return;
-                            }
-                        };
-                    
-                        let device_id = match &text[2] {
-                            Value::String(s) => s.clone(),
-                            _ => {
-                                error!("Third payload element is not a String");
-                                return;
-                            }
-                        };
-                    
-                        info!("Parsed payload successfully");
-        
-                        println!("Peer ID: {}", peer_id);
-                        println!("Answer: {:?}", answer);
-                        println!("Device ID: {}", device_id);
-        
-                        if device_id == *DEVICE_ID {
-                            let answer_json = serde_json::to_string(&answer).unwrap();
-                            let answer: RTCSessionDescription = serde_json::from_str(&answer_json).unwrap();
-                            peer_connection_clone.set_remote_description(answer).await.unwrap();
-                        }
-                    },
-                    Payload::Binary(bin_data) => println!("Received binary data: {:#?}", bin_data),
-                    #[allow(deprecated)]
-                    Payload::String(data) => println!("Received String data: {:?}", data)
-                }
-            }.boxed()
-        }
-    };
-
-    let disconnect_callback = |_, _socket: Client| {
-        async move {
-            println!("Disconnected from the server.");
-        }.boxed()
-    };
-
-    let socket = Arc::new(Mutex::new(ClientBuilder::new("https://signal.trl-ai.com/")
-        .namespace("/") // Ensure the namespace matches your server configuration
-        .on("connect", connect_callback)
-        .on("deviceConnect", device_connect_callback)
-        .on("deviceJoinRoom", djr_callback)
-        .on("deviceCandidate", dc_callback)
-        .on("deviceAnswer", da_callback)
-        .on("disconnect", disconnect_callback)
-        .connect()
-        .await
-        .expect("Connection failed")));
-
-    peer_connection.on_ice_candidate(Box::new({
-        let socket_clone = Arc::clone(&socket); // Clone the Arc
-        move |candidate: Option<RTCIceCandidate>| {
-            let socket_clone = Arc::clone(&socket_clone); // Clone again inside closure
-            async move {
-                if let Some(candidate) = candidate {
-                    println!("Sending ICE candidate");
-                    // println!("Candidate: {:?}", candidate);
-                    let socket = socket_clone.lock(); // Lock the Mutex to access the socket
-                    let room = ROOM.get().expect("ROOM should be set");
-                    socket.await.emit("deviceCandidate", json!({"room": room, "candidate": candidate.to_string(), "peerID": "test"})).await.unwrap();
-                }
-            }.boxed()
-        }
-    }));
-
-    peer_connection.on_ice_gathering_state_change(Box::new(move |state: RTCIceGathererState| {
-        println!("ICE gathering state changed: {:?}", state);
-        Box::pin(async {})
-    }));
-    
-    peer_connection.on_ice_connection_state_change(Box::new(move |state: RTCIceConnectionState| {
-        println!("ICE connection state changed: {:?}", state);
-        Box::pin(async {})
-    }));
-
-    notify.notified().await;
-
-    // Now it's safe to emit the 'deviceJoinRoom' event
-    info!("Emitting deviceJoinRoom event.");
-    let room = ROOM.get().expect("ROOM should be set");
-    socket.lock()
-        .await.emit("deviceJoinRoom", json!({"room": room}))
-        .await
-        .expect("Failed to emit deviceJoinRoom event");
-
-    add_video_track(Arc::clone(&peer_connection)).await;
-}
-
 async fn get_room() -> Option<String> {
     info!("Checking for User in valid room...");
     let token = generate_token(); // Assume this function is defined
@@ -561,10 +296,12 @@ async fn wait_for_room() {
         match get_room().await {
             Some(room) => {
                 info!("Found a valid room: {}", room);
-                if ROOM.set(room.clone()).is_ok() {
-                    break;
-                } else {
-                    warn!("Failed to set the room.");
+                if let Ok(room_id) = room.parse::<u64>() {
+                    if ROOM.set(room_id).is_ok() {
+                        break;
+                    } else {
+                        warn!("Failed to set the room.");
+                    }
                 }
             }
             None => {
@@ -576,21 +313,166 @@ async fn wait_for_room() {
     }
 }
 
+// Update `create_janus_session` to accept ws_stream
+async fn create_janus_session(ws_stream: &mut WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>) -> Result<u64, Box<dyn std::error::Error>> {
+    let transaction_id = format!("create-session-{}", chrono::Utc::now().timestamp_millis());
+
+    // Send the session creation request
+    let session_message = json!({
+        "janus": "create",
+        "transaction": transaction_id
+    });
+    ws_stream.send(Message::Text(session_message.to_string())).await?;
+
+    // Wait for the response
+    if let Some(msg) = ws_stream.next().await {
+        if let Ok(Message::Text(response)) = msg {
+            let parsed: serde_json::Value = serde_json::from_str(&response)?;
+            let session_id = parsed["data"]["id"].as_u64().unwrap();
+            return Ok(session_id);
+        }
+    }
+
+    Err("Failed to create session".into())
+}
+
+async fn attach_videoroom_plugin(ws_stream: &mut WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>, session_id: u64) -> Result<u64, Box<dyn std::error::Error>> {
+    let transaction_id = format!("attach-plugin-{}", chrono::Utc::now().timestamp_millis());
+
+    // Attach to the plugin
+    let attach_message = json!({
+        "janus": "attach",
+        "plugin": "janus.plugin.videoroom",
+        "session_id": session_id,
+        "transaction": transaction_id
+    });
+    
+    ws_stream.send(Message::Text(attach_message.to_string())).await?;
+
+    // Wait for the plugin attachment response
+    if let Some(msg) = ws_stream.next().await {
+        if let Ok(Message::Text(response)) = msg {
+            let parsed: serde_json::Value = serde_json::from_str(&response)?;
+            let handle_id = parsed["data"]["id"].as_u64().unwrap();
+            return Ok(handle_id);
+        }
+    }
+
+    Err("Failed to attach to videoroom plugin".into())
+}
+
+async fn join_room(ws_stream: &mut WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>, session_id: u64, handle_id: u64, room_id: u64) -> Result<(), Box<dyn std::error::Error>> {
+    let transaction_id = format!("join-room-{}", chrono::Utc::now().timestamp_millis());
+
+    let join_message = json!({
+        "janus": "message",
+        "body": {
+            "request": "join",
+            "ptype": "publisher",
+            "room": room_id,
+        },
+        "session_id": session_id,
+        "handle_id": handle_id,
+        "transaction": transaction_id
+    });
+    
+    ws_stream.send(Message::Text(join_message.to_string())).await?;
+
+    // Handle the response
+    if let Some(msg) = ws_stream.next().await {
+        if let Ok(Message::Text(response)) = msg {
+            let parsed: serde_json::Value = serde_json::from_str(&response)?;
+            if parsed["janus"] == "success" {
+                println!("Joined the room successfully");
+                return Ok(());
+            }
+        }
+    }
+
+    Err("Failed to join the room".into())
+}
+
+async fn send_webrtc_offer(
+    ws_stream: &mut WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>, 
+    session_id: u64, 
+    handle_id: u64, 
+    offer_sdp: String
+) -> Result<String, Box<dyn std::error::Error>> {
+    let transaction_id = format!("send-offer-{}", chrono::Utc::now().timestamp_millis());
+
+    // Send the SDP offer to Janus
+    let offer_message = json!({
+        "janus": "message",
+        "body": {
+            "request": "publish",
+            "audio": true,
+            "video": true,
+            "sdp": offer_sdp,
+        },
+        "jsep": {
+            "type": "offer",
+            "sdp": offer_sdp
+        },
+        "transaction": transaction_id,
+        "session_id": session_id,
+        "handle_id": handle_id
+    });
+
+    ws_stream.send(Message::Text(offer_message.to_string())).await?;
+
+    // Handle the response and extract the SDP answer
+    while let Some(msg) = ws_stream.next().await {
+        if let Ok(Message::Text(response)) = msg {
+            let parsed: serde_json::Value = serde_json::from_str(&response)?;
+            if parsed["janus"] == "success" {
+                if let Some(jsep) = parsed["jsep"].as_object() {
+                    if let Some(sdp) = jsep["sdp"].as_str() {
+                        return Ok(sdp.to_string()); // Return the SDP answer
+                    }
+                }
+            }
+        }
+    }
+
+    Err("Failed to send WebRTC offer and receive SDP answer".into())
+}
+
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging
     env_logger::init();
 
+    // 1. Establish WebSocket connection
+    let (mut ws_stream, _) = connect_async("wss://janus.trl-ai.com/janus").await?;
+    
+    // 2. Wait for a valid room to be set
     wait_for_room().await;
 
-    // Create a Notify to wait for the 'connect' event
-    let notify = Arc::new(Notify::new());
+    // 3. Create a Janus session
+    let session_id = create_janus_session(&mut ws_stream).await?;
 
-    // Create a new RTCPeerConnection
+    // 4. Attach to the videoroom plugin and get handle_id
+    let handle_id = attach_videoroom_plugin(&mut ws_stream, session_id).await?;
+
+    let room_id = *ROOM.get().expect("ROOM should be set");
+    join_room(&mut ws_stream, session_id, handle_id, room_id).await?;
+
+    // 5. Create a new WebRTC peer connection
     let pc = Arc::new(create_peer_connection().await);
 
-    setup_socket_io(pc.clone(), notify.clone()).await;
+    // 6. Add video track to the peer connection
+    add_video_track(Arc::clone(&pc)).await;
+
+    // 7. Create an SDP offer
+    let offer = pc.create_offer(None).await.unwrap();
+    pc.set_local_description(offer.clone()).await.unwrap();
+
+    // 8. Send the offer to Janus and receive the SDP answer
+    let sdp_answer = send_webrtc_offer(&mut ws_stream, session_id, handle_id, offer.sdp).await?;
+
+    // 9. Set the SDP answer as the remote description
+    pc.set_remote_description(RTCSessionDescription::answer(sdp_answer)?).await.unwrap();
 
     // Keep the client running to listen for events
     loop {
